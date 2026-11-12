@@ -17,13 +17,19 @@
 #include "cpu/x64/zen64/matmul/zen_matmul.hpp"
 
 #include <assert.h>
+#include <cstring>
 #include <limits>
 
 #include "common/dnnl_thread.hpp"
+#include "common/memory.hpp"
 #include "common/memory_desc_wrapper.hpp"
 #include "common/memory_tracking.hpp"
 #include "common/primitive_attr.hpp"
+#include "common/primitive_desc_iterator.hpp"
 #include "common/primitive_exec_types.hpp"
+#include "common/reorder.hpp"
+#include "common/scratchpad.hpp"
+#include "common/stream.hpp"
 #include "common/utils.hpp"
 #include "common/verbose.hpp"
 
@@ -173,6 +179,24 @@ bool zen_fuses_post_op(
     return false;
 }
 
+// Whether the Zen kernel executes `attr` on its own: default attributes
+// (no scales, zero-points, ...) and post-ops it fuses entirely. Binary src1
+// descriptors must already be resolved.
+bool zen_executes_attr(
+        const primitive_attr_t &attr, const memory_desc_t &dst_md) {
+    using smask_t = primitive_attr_t::skip_mask_t;
+    if (!attr.has_default_values(smask_t::post_ops_inplace | smask_t::sum_dt
+                        | smask_t::accumulation_mode,
+                dst_md.data_type))
+        return false;
+    const auto &po = attr.post_ops_;
+    if (!po.check_sum_consistency(dst_md.data_type, /*is_int8=*/false))
+        return false;
+    for (int i = 0; i < po.len(); i++)
+        if (!zen_fuses_post_op(po, i, dst_md)) return false;
+    return true;
+}
+
 } // namespace
 #endif
 
@@ -291,6 +315,33 @@ status_t zen_matmul_t::pd_t::init(const engine_t *engine) {
         return bia_dt_ok && is_bias_1xN();
     };
     VDISPATCH_MATMUL(check_bias(), VERBOSE_UNSUPPORTED_BIAS_CFG);
+
+    // No other implementation reads zen_packed weights. If the Zen kernel
+    // cannot execute the attributes, accept the descriptor anyway: execute()
+    // unpacks the weights and runs the matmul through the next implementation.
+    if (zen::is_zen_packed(*weights_md(0))) {
+        VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+        VDISPATCH_MATMUL(
+                attr_.set_default_formats(dst_md(0)) == status::success,
+                VERBOSE_UNSUPPORTED_POSTOP);
+        if (!zen_executes_attr(*attr(), *dst_md(0))) {
+            const memory_desc_t &wei_md = *weights_md(0);
+            VDISPATCH_MATMUL_SC(
+                    memory_desc_init_by_tag(plain_wei_md_, wei_md.ndims,
+                            wei_md.dims, wei_md.data_type,
+                            wei_md.ndims == 2 ? format_tag::ab
+                                              : format_tag::abc),
+                    VERBOSE_UNSUPPORTED_TAG);
+            // Unpacked on every execution: the weights may change between
+            // calls.
+            scratchpad_registry().registrar().book(
+                    memory_tracking::names::key_matmul_wei_trans,
+                    memory_desc_wrapper(plain_wei_md_).size(),
+                    /*data_size=*/1, /*alignment=*/64);
+            use_unpack_fallback_ = true;
+            return status::success;
+        }
+    }
 
     // ---- Attribute validation ----
     // For f32/bf16/f16: with prepacked weights, supported post-op chains
@@ -740,10 +791,92 @@ status_t zen_matmul_direct(data_type_t src_dt, data_type_t wei_dt,
 } // anonymous namespace
 #endif // DNNL_X64_USE_ZEN
 
+// Caller holds unpack_fallback_mutex_.
+status_t zen_matmul_t::create_unpack_fallback(engine_t *engine) const {
+    std::shared_ptr<primitive_desc_t> unpack_pd;
+    CHECK(reorder_primitive_desc_create(
+            unpack_pd, engine, pd()->weights_md(0), &pd()->plain_wei_md()));
+
+    // Same problem and attributes on plain weights, from the first
+    // implementation in dispatch order that is not a Zen one.
+    matmul_desc_t matmul_desc;
+    CHECK(matmul_desc_init(&matmul_desc, pd()->src_md(0), &pd()->plain_wei_md(),
+            pd()->with_bias() ? pd()->weights_md(1) : nullptr,
+            pd()->dst_md(0)));
+    std::shared_ptr<primitive_desc_t> matmul_pd;
+    primitive_desc_iterator_t it(
+            engine, (op_desc_t *)&matmul_desc, pd()->attr(), nullptr);
+    while (++it != it.end()) {
+        if (*it && std::strstr((*it)->name(), "zen") == nullptr) {
+            matmul_pd = *it;
+            break;
+        }
+    }
+    if (!matmul_pd) return status::unimplemented;
+
+    std::shared_ptr<primitive_t> unpack, matmul;
+    CHECK(unpack_pd->create_primitive(unpack, engine));
+    CHECK(matmul_pd->create_primitive(matmul, engine));
+    unpack_ = std::move(unpack);
+    fallback_matmul_ = std::move(matmul);
+    return status::success;
+}
+
+status_t zen_matmul_t::execute_unpack_fallback(const exec_ctx_t &ctx) const {
+    engine_t *engine = ctx.stream()->engine();
+    {
+        // unpack_ and fallback_matmul_ are set once here and never reset.
+        std::lock_guard<std::mutex> guard(unpack_fallback_mutex_);
+        if (!fallback_matmul_) CHECK(create_unpack_fallback(engine));
+    }
+
+    void *plain_wei = ctx.get_scratchpad_grantor().get<void>(
+            memory_tracking::names::key_matmul_wei_trans);
+    if (plain_wei == nullptr) return status::out_of_memory;
+    std::unique_ptr<memory_t, memory_deleter_t> plain_wei_mem(new memory_t(
+            engine, &pd()->plain_wei_md(), use_runtime_ptr, plain_wei));
+
+    // The nested primitives did not exist when the scratchpad was booked, so
+    // they share a buffer of their own (they run one after the other).
+    const auto &unpack_registry = unpack_->pd()->scratchpad_registry();
+    const auto &matmul_registry = fallback_matmul_->pd()->scratchpad_registry();
+    const size_t nested_size
+            = nstl::max(unpack_registry.size(), matmul_registry.size());
+    std::unique_ptr<scratchpad_t> nested_scratchpad;
+    const memory_storage_t *nested_storage = nullptr;
+    if (nested_size > 0) {
+        nested_scratchpad.reset(create_scratchpad(
+                engine, nested_size, /*use_global_scratchpad=*/false));
+        if (!nested_scratchpad || !nested_scratchpad->get_memory_storage())
+            return status::out_of_memory;
+        nested_storage = nested_scratchpad->get_memory_storage();
+    }
+    const void *nested_host_ptr
+            = ctx.host_ptr(nested_storage, /*require_host_ptr=*/true);
+
+    exec_args_t unpack_args;
+    unpack_args[DNNL_ARG_FROM] = ctx.args().at(DNNL_ARG_WEIGHTS);
+    unpack_args[DNNL_ARG_TO] = {plain_wei_mem.get(), false};
+    exec_ctx_t unpack_ctx(ctx, std::move(unpack_args));
+    unpack_ctx.set_scratchpad_grantor(
+            unpack_registry.create_grantor(nested_storage, nested_host_ptr));
+    CHECK(unpack_->execute(unpack_ctx));
+
+    // All other arguments (bias, post-op, scale, zero-point) pass through.
+    exec_args_t matmul_args = ctx.args();
+    matmul_args[DNNL_ARG_WEIGHTS] = {plain_wei_mem.get(), true};
+    exec_ctx_t matmul_ctx(ctx, std::move(matmul_args));
+    matmul_ctx.set_scratchpad_grantor(
+            matmul_registry.create_grantor(nested_storage, nested_host_ptr));
+    return fallback_matmul_->execute(matmul_ctx);
+}
+
 status_t zen_matmul_t::execute_body(const exec_ctx_t &ctx) const {
 #if !DNNL_X64_USE_ZEN
     return status::unimplemented;
 #else
+    if (pd()->use_unpack_fallback()) return execute_unpack_fallback(ctx);
+
     // Build memory_desc_wrappers (needed by matmul_helper_t).
     const auto src_d = ctx.memory_mdw(DNNL_ARG_SRC, pd()->src_md());
     const auto weights_d = ctx.memory_mdw(DNNL_ARG_WEIGHTS, pd()->weights_md());

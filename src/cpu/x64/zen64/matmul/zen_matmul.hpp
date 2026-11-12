@@ -18,6 +18,7 @@
 #define CPU_X64_ZEN64_MATMUL_ZEN_MATMUL_HPP
 
 #include <memory>
+#include <mutex>
 #include <vector>
 
 #include "common/c_types_map.hpp"
@@ -65,6 +66,12 @@ struct zen_matmul_t : public primitive_t {
             return post_ops_fallback_;
         }
 
+        // Prepacked weights with attributes the Zen kernel cannot execute:
+        // execute() unpacks the weights to plain_wei_md() and runs the whole
+        // problem through the next (non-Zen) implementation.
+        bool use_unpack_fallback() const { return use_unpack_fallback_; }
+        const memory_desc_t &plain_wei_md() const { return plain_wei_md_; }
+
     private:
         status_t init_post_ops(const engine_t *engine, bool wei_already_packed);
         bool pp_kernel_ok(const post_ops_t &post_ops) const;
@@ -72,6 +79,8 @@ struct zen_matmul_t : public primitive_t {
         // The suffix shows in verbose output that post-ops run after the Zen
         // kernel and how.
         const char *impl_name() const {
+            if (use_unpack_fallback_)
+                return "zen:matmul:f32|bf16|f16:amd+unpack_fallback";
             if (use_pp_kernel_) return "zen:matmul:f32|bf16|f16:amd+pp_kernel";
             if (!post_ops_fallback_.empty())
                 return "zen:matmul:f32|bf16|f16:amd+post_ops_fallback";
@@ -83,6 +92,8 @@ struct zen_matmul_t : public primitive_t {
         bool use_pp_kernel_ = false;
         primitive_attr_t pp_attr_;
         zen::post_ops_fallback_t post_ops_fallback_;
+        bool use_unpack_fallback_ = false;
+        memory_desc_t plain_wei_md_ {};
     };
 
     zen_matmul_t(const pd_t *apd) : primitive_t(apd) {}
@@ -98,6 +109,13 @@ struct zen_matmul_t : public primitive_t {
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
     status_t execute_body(const exec_ctx_t &ctx) const;
+    status_t execute_unpack_fallback(const exec_ctx_t &ctx) const;
+    status_t create_unpack_fallback(engine_t *engine) const;
+
+    // Created on the first execute() with use_unpack_fallback().
+    mutable std::mutex unpack_fallback_mutex_;
+    mutable std::shared_ptr<primitive_t> unpack_;
+    mutable std::shared_ptr<primitive_t> fallback_matmul_;
 
     std::unique_ptr<::dnnl::impl::cpu::inner_product_utils::pp_kernel_t>
             pp_kernel_;
